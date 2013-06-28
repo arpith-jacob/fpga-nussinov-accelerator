@@ -1,0 +1,15 @@
+
+December 15, 2009
+
+This is a 2D version of the Nussinov array.  Arrays are instantiated along the
+j and k dimensions.  The j axis is tiled, with each processor in the j dimension
+executing W_j cells.
+
+Given an RNA of length N, the schedule for this array is:
+
+S(i, j, k) = -W_j i + 2 v_j + 2W_j j' - k
+A(i, j, k) = j', k
+
+The only constraint is that gcd(2, W_j) = 1, so W_j must be odd.
+The latency of execution is W_j (N-1) + 2N - 2
+

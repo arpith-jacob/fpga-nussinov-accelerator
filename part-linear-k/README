@@ -1,0 +1,33 @@
+
+October 8, 2009
+
+This is a linear version of the Nussinov array.  Arrays are instantiated along the
+'k' dimension.  Points in the i-j plane are computed by its processor in the k
+axis.
+
+No partitioning along k is done since this will increase coding complexity.  We
+do not anticipate requiring partitioning since we believe we can instantiate this
+linear array big enough to process most RNAs.
+
+We decided to partition along the k axis and not on the i or j axis because:
+  1. Fewer processing elements are needed: N/2 versus N, although the execution
+     time is also higher.
+  2. Resource intensive logic for Nussinov + Zuker are concentrated at k=1.  With
+     our selected allocation, we are able to contain this logic in one processor.
+
+Given an RNA of length N, the schedule for this array is:
+
+S(i, j, k) = Nj - 2i - k
+A(i, j, k) = k
+
+The only constraint is that gcd(2, N) = 1, so N must be odd.  This is already
+enforced anyway.
+
+
+November 2:
+
+
+NO_PE=271 works with LUTmems
+with block rams N=545 @ 140MhZ
+
+

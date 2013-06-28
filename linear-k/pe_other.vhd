@@ -1,0 +1,438 @@
+
+-- File: pe_other.vhd
+-- Date: 9 October 2009
+-- Project: Nussinov
+-- Author: Arpith Chacko Jacob
+--         Department of Computer Science and Engineering
+--         Washington University in Saint Louis
+-- Description:
+--      Processing element implementing all except the bottom cells of the
+-- nussinov GJQ array.
+
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.std_logic_arith.all;
+use ieee.std_logic_unsigned.all;
+
+library work;
+use work.nussinov_pkg.all;
+
+entity pe_other is
+  generic (
+    -- When true delay registers are placed in block ram memories
+    USE_BRAM        : boolean := false
+    );
+  port (
+    clk             : in  sl;
+    reset           : in  sl;
+
+    --
+    -- INPUT
+    --
+    -- input control signals
+    in_start_aggr   : in  sl;   -- start max aggregating along k axis
+    in_init_pipe58  : in  sl;   -- initialize pipelines 5 and 8
+
+    -- X dependencies
+    -- X(i, j, k+1)
+    in_X_i_j_kp1    : in  slv(CELL_WIDTH-1 downto 0);
+
+    -- pipeline dependencies
+    -- X6(i+1, j, k-1)
+    in_X6_ip1_j_km1 : in  slv(CELL_WIDTH-1 downto 0);
+    -- X7(i, j-1, k-1)
+    in_X7_i_jm1_km1 : in  slv(CELL_WIDTH-1 downto 0);
+
+    --
+    -- OUTPUT
+    --
+    -- output dependencies
+    -- X(i, j, k)
+    out_X_i_j_k     : out slv(CELL_WIDTH-1 downto 0);
+    -- X6(i, j, k)
+    out_X6_i_j_k    : out slv(CELL_WIDTH-1 downto 0);
+    -- X7(i, j, k)
+    out_X7_i_j_k    : out slv(CELL_WIDTH-1 downto 0);
+
+    -- output control signals
+    out_start_aggr  : out sl;
+    out_init_pipe58 : out sl
+    );
+end entity;
+
+architecture rtl of pe_other is
+
+  component delay_pipe is
+    generic (
+      DATA_WIDTH     : natural := 1;
+      DELAY_STATES   : natural := 1;
+      NEEDS_RESET    : boolean := true;
+
+      -- When needs reset=true, True: set all vals to 1, else 0
+      RESET_VAL_HIGH : boolean := false
+      );
+    port (
+      clk   : in  sl;
+      reset : in  sl;
+      din   : in  slv (DATA_WIDTH-1 downto 0);
+      dout  : out slv (DATA_WIDTH-1 downto 0)
+      );
+  end component;
+
+  component delay_fifo is
+    port (
+      rd_en : in STD_LOGIC := 'X'; 
+      wr_en : in STD_LOGIC := 'X'; 
+      full : out STD_LOGIC; 
+      empty : out STD_LOGIC; 
+      clk : in STD_LOGIC := 'X'; 
+      srst : in STD_LOGIC := 'X'; 
+      dout : out STD_LOGIC_VECTOR ( 17 downto 0 ); 
+      din : in STD_LOGIC_VECTOR ( 17 downto 0 ) 
+    );
+  end component;
+
+  -----------------------------------------------------------------------------
+  -- Mux signal along communication link: either an initialization value, or
+  -- the value sent from a processing element
+  -----------------------------------------------------------------------------
+  signal mux_start_aggr          : slv(0 downto 0);
+  signal mux_init_pipe58         : slv(0 downto 0);
+
+  signal in_start_aggr_delayed   : slv(0 downto 0);
+  signal in_init_pipe58_delayed  : slv(0 downto 0);
+
+  signal in_X5_i_jm1_k_delayed   : slv(CELL_WIDTH-1 downto 0);
+  signal in_X7_i_jm1_km1_delayed : slv(CELL_WIDTH-1 downto 0);
+  signal in_X8_ip1_j_k_delayed   : slv(CELL_WIDTH-1 downto 0);
+
+  -- signals used for FIFO delay
+  signal delay_dout_del          : slv(17 downto 0); 
+  signal delay_dout              : slv(17 downto 0); 
+  signal delay_din               : slv(17 downto 0); 
+
+  signal wr_start                : slv(0 downto 0);
+  signal delay_wr                : slv(0 downto 0);
+  signal delay_rd                : slv(0 downto 0);
+
+  signal in_X5_i_jm1_k_fifo      : slv(CELL_WIDTH-1 downto 0);
+
+  -----------------------------------------------------------------------------
+  -- Intermediate computation signals
+  -----------------------------------------------------------------------------
+  signal X5_i_j_k_max            : slv(CELL_WIDTH-1 downto 0);
+  signal X6_i_j_k_max            : slv(CELL_WIDTH-1 downto 0);
+  signal X7_i_j_k_max            : slv(CELL_WIDTH-1 downto 0);
+  signal X8_i_j_k_max            : slv(CELL_WIDTH-1 downto 0);
+
+  signal X_max_pipeline_gt       : sl;
+  signal X_max_pipeline          : slv(CELL_WIDTH-1 downto 0);
+
+  signal X5_i_j_k_plus_X6_i_j_k  : slv(CELL_WIDTH-1 downto 0);
+  signal X7_i_j_k_plus_X8_i_j_k  : slv(CELL_WIDTH-1 downto 0);
+
+  signal X_kaggr                 : slv(CELL_WIDTH-1 downto 0);
+
+  signal X_all_gt                : sl;
+  signal X_all                   : slv(CELL_WIDTH-1 downto 0);
+
+  -----------------------------------------------------------------------------
+  -- Output signals
+  -----------------------------------------------------------------------------
+  signal X_i_j_k     : slv(CELL_WIDTH-1 downto 0);
+  signal X5_i_j_k    : slv(CELL_WIDTH-1 downto 0);
+  signal X6_i_j_k    : slv(CELL_WIDTH-1 downto 0);
+  signal X7_i_j_k    : slv(CELL_WIDTH-1 downto 0);
+  signal X8_i_j_k    : slv(CELL_WIDTH-1 downto 0);
+
+  signal start_aggr  : sl;
+  signal init_pipe58 : sl;
+
+begin
+
+  -----------------------------------------------------------------------------
+  -- Delay communication links according to the schedule
+  -----------------------------------------------------------------------------
+  -- start_aggr(i+1, j-1, k-1)   -- to start aggregation at k = (j-i)/2
+  mux_start_aggr(0) <= in_start_aggr;
+  delay_start_aggr : delay_pipe
+    generic map (
+      DATA_WIDTH     => 1,
+      DELAY_STATES   => NO_PE,  -- delay = NO_PE+1
+      NEEDS_RESET    => false,
+      RESET_VAL_HIGH => false
+      )
+    port map (
+      clk            => clk,
+      reset          => reset,
+      din            => mux_start_aggr,
+      dout           => in_start_aggr_delayed
+      );
+
+  -- init_pipe58(i+1, j-1, k-1)
+  mux_init_pipe58(0) <= in_init_pipe58;
+  delay_init_pipe58 : delay_pipe
+    generic map (
+      DATA_WIDTH     => 1,
+      DELAY_STATES   => NO_PE,  -- delay = NO_PE+1
+      NEEDS_RESET    => false,
+      RESET_VAL_HIGH => false
+      )
+    port map (
+      clk            => clk,
+      reset          => reset,
+      din            => mux_init_pipe58,
+      dout           => in_init_pipe58_delayed
+      );
+
+  -- X8(i+1, j, k)
+  delay_X8_ip1_j_k : delay_pipe
+    generic map (
+      DATA_WIDTH     => CELL_WIDTH,
+      DELAY_STATES   => 1,  -- delay = 2
+      NEEDS_RESET    => false,
+      RESET_VAL_HIGH => false
+      )
+    port map (
+      clk            => clk,
+      reset          => reset,
+      din            => X8_i_j_k,
+      dout           => in_X8_ip1_j_k_delayed
+      );
+
+
+  -----------------------------------------------------------------------------
+  -- Generate memory intensive link delays using LUTS
+  -----------------------------------------------------------------------------
+  gen_delays_luts : if (not USE_BRAM) generate
+    -- X5(i, j-1, k)
+    delay_X5_i_jm1_k : delay_pipe
+      generic map (
+        DATA_WIDTH     => CELL_WIDTH,
+        DELAY_STATES   => NO_PE-1,  -- delay = NO_PE
+        NEEDS_RESET    => false,
+        RESET_VAL_HIGH => false
+        )
+      port map (
+        clk            => clk,
+        reset          => reset,
+        din            => X5_i_j_k,
+        dout           => in_X5_i_jm1_k_delayed
+        );
+
+    -- X7(i, j-1, k-1)
+    delay_X7_i_jm1_km1 : delay_pipe
+      generic map (
+        DATA_WIDTH     => CELL_WIDTH,
+        DELAY_STATES   => NO_PE-2,  -- delay = NO_PE-1
+        NEEDS_RESET    => false,
+        RESET_VAL_HIGH => false
+        )
+      port map (
+        clk            => clk,
+        reset          => reset,
+        din            => in_X7_i_jm1_km1,
+        dout           => in_X7_i_jm1_km1_delayed
+        );
+  end generate gen_delays_luts;
+
+  -----------------------------------------------------------------------------
+  -- Generate memory intensive link delays using block RAMs
+  -----------------------------------------------------------------------------
+  gen_delays_bram : if (USE_BRAM) generate
+    -- delay of NO_PE-2 should not exceed capacity of block ram which is
+    -- 1024.
+    assert (NO_PE-2 <= 1024) report
+      "pe_other block ram has insufficient capacity" severity error;
+
+    -- instantiates block ram
+    delay_links : delay_fifo
+      port map (
+        clk    => clk,
+        srst   => reset,
+
+        rd_en  => delay_rd(0),
+        dout   => delay_dout_del,
+        full   => open,
+
+        wr_en  => delay_wr(0),
+        din    => delay_din,
+        empty  => open
+      );
+
+    -- input into delay block ram
+    delay_din               <= "00" & in_X7_i_jm1_km1 & X5_i_j_k;
+
+    -- output from delay block ram
+    -- register output of FIFO by one clock cycle here to improve timing
+    -- we could have placed this flop in the fifo itself, but we place it
+    -- here explicitly so that the critical path from the block ram output
+    -- to the logic is decreased
+    reg_fifo_output : process (clk)
+    begin 
+      if rising_edge(clk) then
+        delay_dout <= delay_dout_del;
+      end if;  -- end rising_edge
+    end process reg_fifo_output;
+
+    -- X5 element needs one extra clock delay
+    in_X5_i_jm1_k_fifo      <= delay_dout(CELL_WIDTH-1 downto 0);
+    in_X7_i_jm1_km1_delayed <= delay_dout(2*CELL_WIDTH-1 downto CELL_WIDTH);
+
+    -- delay element to read from fifo at correct time
+    delay_fifo_rd : delay_pipe
+      generic map (
+        DATA_WIDTH     => 1,
+        DELAY_STATES   => NO_PE-4,  -- delay = NO_PE-4 because read latency=1
+        NEEDS_RESET    => true,     -- and output of fifo is flopped.
+        RESET_VAL_HIGH => false
+        )
+      port map (
+        clk            => clk,
+        reset          => reset,
+        din            => delay_wr,
+        dout           => delay_rd
+        );
+
+    -- delay element to write to fifo a few clocks after reset is asserted
+    delay_fifo_wr : delay_pipe
+      generic map (
+        DATA_WIDTH     => 1,
+        DELAY_STATES   => 5,        -- delay = 5 clocks
+        NEEDS_RESET    => true,     -- wait for a few clocks so that block
+        RESET_VAL_HIGH => false     -- ram has a chance to settle
+        )
+      port map (
+        clk            => clk,
+        reset          => reset,
+        din            => wr_start,
+        dout           => delay_wr
+        );
+
+    -- registers to control reading and writing into block ram
+    reg_fifo : process (clk)
+    begin 
+      if rising_edge(clk) then
+        if reset = '1' then
+          wr_start              <= (others => '0');
+
+          in_X5_i_jm1_k_delayed <= (others => '0');
+        else
+          -- keep writing into block ram based delay register
+          wr_start(0)           <= '1';
+
+          in_X5_i_jm1_k_delayed <= in_X5_i_jm1_k_fifo;
+        end if;
+      end if;  -- end rising_edge
+    end process reg_fifo;
+  end generate gen_delays_bram;
+
+  -----------------------------------------------------------------------------
+  -- Compute values for data variables
+  -----------------------------------------------------------------------------
+
+  -----------------------------------------------------------------------------
+  -- Pipeline variable X5
+  -----------------------------------------------------------------------------
+
+  X5_i_j_k_max <= X7_i_j_k_max when in_init_pipe58_delayed(0) = '1' else
+                  in_X5_i_jm1_k_delayed;
+
+  -----------------------------------------------------------------------------
+  -- Pipeline variable X6
+  -----------------------------------------------------------------------------
+
+  X6_i_j_k_max <= in_X6_ip1_j_km1;
+
+  -----------------------------------------------------------------------------
+  -- Pipeline variable X7
+  -----------------------------------------------------------------------------
+
+  X7_i_j_k_max <= in_X7_i_jm1_km1_delayed;
+
+  -----------------------------------------------------------------------------
+  -- Pipeline variable X8
+  -----------------------------------------------------------------------------
+
+  X8_i_j_k_max <= X6_i_j_k_max when in_init_pipe58_delayed(0) = '1' else
+                  in_X8_ip1_j_k_delayed;
+
+  -----------------------------------------------------------------------------
+  -- Data variable X
+  -----------------------------------------------------------------------------
+
+  -- X5(i, j, k) + X6(i, j, k)
+  X5_i_j_k_plus_X6_i_j_k <= X5_i_j_k_max + X6_i_j_k_max;
+
+  -- X7(i, j, k) + X8(i, j, k)
+  X7_i_j_k_plus_X8_i_j_k <= X7_i_j_k_max + X8_i_j_k_max;
+  
+  -- max of pipeline dependencies
+  -- max ( X5(i, j, k) + X6(i, j, k),
+  --       X7(i, j, k) + X8(i, j, k)
+  --     )
+  X_max_pipeline_gt <= '1' when X5_i_j_k_plus_X6_i_j_k > X7_i_j_k_plus_X8_i_j_k
+                       else
+                       '0';
+  X_max_pipeline    <= X5_i_j_k_plus_X6_i_j_k when X_max_pipeline_gt = '1'
+                       else
+                       X7_i_j_k_plus_X8_i_j_k;
+
+  -- Compute aggregate term: initialize, or previous value
+  -- X(i, j, k + 1)
+  X_kaggr <= ZEROES(CELL_WIDTH-1 downto 0) when in_start_aggr_delayed(0) = '1'
+             else
+             in_X_i_j_kp1;
+
+  -- Compute final max between k aggregate
+  -- and the pipeline dependencies
+  X_all_gt <= '1' when X_max_pipeline > X_kaggr
+              else
+              '0';
+  X_all    <= X_max_pipeline when X_all_gt = '1'
+              else
+              X_kaggr;
+
+  -----------------------------------------------------------------------------
+  -- Process to register computed values for data variables
+  -----------------------------------------------------------------------------
+  reg_values_noreset: process (clk)
+  begin 
+    if rising_edge(clk) then
+        -- register computed values: output
+        X_i_j_k     <= X_all;
+        X5_i_j_k    <= X5_i_j_k_max;
+        X6_i_j_k    <= X6_i_j_k_max;
+        X7_i_j_k    <= X7_i_j_k_max;
+        X8_i_j_k    <= X8_i_j_k_max;
+    end if;  -- end rising_edge
+  end process reg_values_noreset;
+
+  reg_values: process (clk)
+  begin 
+    if rising_edge(clk) then
+      if reset = '1' then
+        -- register control signals
+        start_aggr  <= '0';
+        init_pipe58 <= '0';
+      else
+        -- register control signals
+        start_aggr  <= in_start_aggr_delayed(0);
+        init_pipe58 <= in_init_pipe58_delayed(0);
+      end if;
+    end if;  -- end rising_edge
+  end process reg_values;
+
+  -----------------------------------------------------------------------------
+  -- Assign output signals
+  -----------------------------------------------------------------------------
+
+  out_X_i_j_k     <= X_i_j_k;
+  out_X6_i_j_k    <= X6_i_j_k;
+  out_X7_i_j_k    <= X7_i_j_k;
+
+  out_start_aggr  <= start_aggr;
+  out_init_pipe58 <= init_pipe58;
+
+end rtl;
+
